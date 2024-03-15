@@ -1,4 +1,4 @@
-module db-insertion
+module go-mysql-worker
 
 go 1.22.1
 
