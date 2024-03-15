@@ -14,3 +14,11 @@ func TestStringToAnyList(t *testing.T) {
 	assert.Equal(t, len(list), 3, "len(list) should be 3")
 	assert.Equal(t, list[0], "Abc", "list[0] should be Abc")
 }
+
+func TestGenerateQuestionsMark(t *testing.T) {
+	assert.DeepEqual(t, generateQuestionsMark(3), []string{"?", "?", "?"})
+}
+
+func TestProcessCSVFileWithWorker(t *testing.T) {
+	// TODO
+}

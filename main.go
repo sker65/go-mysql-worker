@@ -6,13 +6,14 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"os"
 	"runtime/pprof"
 	"strings"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/joho/godotenv"
@@ -21,9 +22,10 @@ import (
 const (
 	dbMaxIdleConns    = 4
 	dbMaxConns        = 100
-	totalWorkers      = 10
+	totalWorkers      = 100
 	channelBufferSize = 100
-	csvFile           = "majestic_million.csv"
+	sqlBatchSize      = 8
+	CsvFile           = "majestic_million.csv"
 )
 
 var (
@@ -35,10 +37,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err.Error())
 	}
-	var dbUsername = os.Getenv("DB_USERNAME")
-	var dbName = os.Getenv("DB_NAME")
-	var dbPass = os.Getenv("DB_PASSWORD")
-	var dbConnString = fmt.Sprintf("%s:%s@tcp(localhost:3306)/%s", dbUsername, dbPass, dbName)
+
+	log.SetFormatter(&log.TextFormatter{
+		DisableColors: false,
+		FullTimestamp: true,
+	})
 
 	f, err := os.Create("myprogram.prof")
 	if err != nil {
@@ -48,20 +51,20 @@ func main() {
 	pprof.StartCPUProfile(f)
 	start := time.Now()
 
-	db, err := OpenDBConnection(dbConnString)
+	db, err := OpenDBConnection()
 	if err != nil {
 		log.Fatal(err.Error())
 	}
 	defer db.Close()
 
-	csvReader, csvFile, err := OpenCSVFile()
+	csvReader, csvFile, err := OpenCSVFile(CsvFile)
 	if err != nil {
 		log.Fatal(err.Error())
 	}
 	defer csvFile.Close()
 
 	row, err := csvReader.Read()
-	if err == nil && len(dataHeaders) == 0 {
+	if err == nil {
 		dataHeaders = row
 		log.Println("Fields found:", dataHeaders)
 	}
@@ -71,9 +74,9 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	go DispatchWorkers(db, jobs, &wg, quit)
-	ProcessCSVFileWithWorker(csvReader, jobs)
-	quitWorkers(quit)
+	go StartWorkers(db, jobs, &wg, quit)
+	ProcessCSVFile(csvReader, jobs, 2000000)
+	StopWorkers(quit)
 	wg.Wait()
 	pprof.StopCPUProfile()
 
@@ -81,16 +84,15 @@ func main() {
 	log.Printf("Done in %d seconds", int(math.Ceil(duration.Seconds())))
 }
 
-func quitWorkers(quit chan bool) {
-	log.Println("Quitting workers")
-	for i := 0; i < totalWorkers; i++ {
-		quit <- true
-	}
-}
+func OpenDBConnection() (*sql.DB, error) {
 
-func OpenDBConnection(dbConnString string) (*sql.DB, error) {
+	dbUsername := os.Getenv("DB_USERNAME")
+	dbName := os.Getenv("DB_NAME")
+	dbPass := os.Getenv("DB_PASSWORD")
+	dbConnString := fmt.Sprintf("%s:%s@tcp(localhost:3306)/%s", dbUsername, dbPass, dbName)
+	dbConnStringPrintable := fmt.Sprintf("%s:***@tcp(localhost:3306)/%s", dbUsername, dbName)
 
-	log.Printf("Open DB connection using %s", dbConnString)
+	log.Printf("Open DB connection using %s", dbConnStringPrintable)
 
 	db, err := sql.Open("mysql", dbConnString)
 	if err != nil {
@@ -103,11 +105,13 @@ func OpenDBConnection(dbConnString string) (*sql.DB, error) {
 	return db, nil
 }
 
-func OpenCSVFile() (*csv.Reader, *os.File, error) {
-	log.Println("Open CSV file")
+// OpenCSVFile opens a CSV file and returns a reader and a file handle
+func OpenCSVFile(filename string) (*csv.Reader, *os.File, error) {
+	log.Printf("Open CSV file '%s'\n", filename)
 
-	file, err := os.Open(csvFile)
+	file, err := os.Open(filename)
 	if err != nil {
+		log.Println("error opening csv file ", file, err.Error())
 		return nil, nil, err
 	}
 
@@ -115,6 +119,7 @@ func OpenCSVFile() (*csv.Reader, *os.File, error) {
 	return reader, file, nil
 }
 
+// toAnyList converts a slice of T to a slice of any
 func toAnyList[T any](input []T) []any {
 	list := make([]any, len(input))
 	for i, v := range input {
@@ -124,7 +129,6 @@ func toAnyList[T any](input []T) []any {
 }
 
 func worker(workerIndex int, db *sql.DB, jobs <-chan []string, query string, placeholders string, wg *sync.WaitGroup, quit <-chan bool) {
-	maxBatchSize := 8
 	defer wg.Add(-1)
 	conn, err := db.Conn(context.Background())
 	if err != nil {
@@ -150,11 +154,11 @@ func worker(workerIndex int, db *sql.DB, jobs <-chan []string, query string, pla
 					if counter > 0 {
 						q = q + ", (" + placeholders + ")"
 					}
-					//log.Println("Got values ", workerIndex, counter, len(job))
+					log.Trace("Got values ", workerIndex, counter, len(job))
 					counter++
 				}
 			}
-			if counter >= maxBatchSize || timeout {
+			if counter >= sqlBatchSize || timeout {
 				break
 			}
 		}
@@ -163,7 +167,7 @@ func worker(workerIndex int, db *sql.DB, jobs <-chan []string, query string, pla
 		}
 		if len(values) > 0 {
 			_, err = conn.ExecContext(context.Background(), q, toAnyList(values)...)
-			log.Println("Worker data:", counter, query, values)
+			log.Trace("Worker data:", counter, query, values)
 			if err != nil {
 				log.Fatal(err.Error())
 			}
@@ -181,7 +185,8 @@ func worker(workerIndex int, db *sql.DB, jobs <-chan []string, query string, pla
 	}
 }
 
-func DispatchWorkers(db *sql.DB, jobs <-chan []string, wg *sync.WaitGroup, quit <-chan bool) {
+// StartWorkers starts all workers providing them a job queue and a wait group, database connection and a query to execute
+func StartWorkers(db *sql.DB, jobs <-chan []string, wg *sync.WaitGroup, quit <-chan bool) {
 	var placeholders = strings.Join(generateQuestionsMark(len(dataHeaders)), ",")
 	var query = fmt.Sprintf("INSERT INTO domain (%s) VALUES (%s)",
 		strings.Join(dataHeaders, ","),
@@ -194,9 +199,19 @@ func DispatchWorkers(db *sql.DB, jobs <-chan []string, wg *sync.WaitGroup, quit 
 	}
 }
 
-func ProcessCSVFileWithWorker(reader *csv.Reader, jobs chan<- []string) {
+// StopWorkers stops all workers by sending them a quit signal
+func StopWorkers(quit chan bool) {
+	log.Println("Quitting workers")
+	for i := 0; i < totalWorkers; i++ {
+		quit <- true
+	}
+}
+
+// ProcessCSVFile processes a CSV file and sends the rows to the jobs channel
+// processing ends either when eof or maxLines is reached
+func ProcessCSVFile(reader *csv.Reader, jobs chan<- []string, maxLines int) {
 	rowcount := 0
-	for ; rowcount < 11; rowcount++ {
+	for ; rowcount < maxLines; rowcount++ {
 		row, err := reader.Read()
 		if err != nil {
 			if err == io.EOF {
@@ -205,17 +220,18 @@ func ProcessCSVFileWithWorker(reader *csv.Reader, jobs chan<- []string) {
 			break
 		}
 
-		log.Println("read line with values:", row)
+		log.Traceln("read line with values:", row)
 		jobs <- row
 		if rowcount%1000 == 0 {
 			log.Printf("Processed %d rows", rowcount)
 		}
-		time.Sleep(2 * time.Second)
+		// for testing only time.Sleep(2 * time.Second)
 	}
 	log.Printf("Processed %d rows", rowcount)
 	close(jobs)
 }
 
+// generateQuestionsMark generates a slice of question marks of length n (used for building SQL statements)
 func generateQuestionsMark(n int) []string {
 	var r = make([]string, n)
 	for i := range r {
